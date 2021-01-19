@@ -3,11 +3,11 @@
 patacd.asm - IDE (Parallel ATA) CD-ROM driver for MS-DOS
 
 target:  MS-DOS 3.1 or later
-         IBM PC/AT compatible or NEC PC-9801 compatible
+         NEC PC-9801 compatible with PC-98 File Slot IDE Adapter
 author:  lpproj
 license: the ZLIB license
 
-  Copyright (C) 2016 sava (t.ebisawa)
+  Copyright (C) 2016 sava (t.ebisawa) / @v9938
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
@@ -48,6 +48,8 @@ to build:
 %undef SUPPORT_AUDIO_CHANNEL
 %endif
 
+;%define DEBUGP
+
 
 CR     equ 13
 LF     equ 10
@@ -72,6 +74,7 @@ IDX_COMMAND             equ 7
 IDX_STATUS              equ IDX_COMMAND
 IDX_DEVICE_CONTROL      equ 8
 IDX_ALTERNATE_STATUS    equ IDX_DEVICE_CONTROL
+IDX_DRDY_Chk            equ 9
 
 OFS_DATA                equ (IDX_DATA * 2)
 OFS_FEATURES            equ (IDX_FEATURES * 2)
@@ -92,7 +95,9 @@ OFS_ALTERNATE_STATUS    equ (IDX_ALTERNATE_STATUS * 2)
 IBM_TIMER_TICKS         equ 046ch       ; 0040:006C dword
 NEC98_TIMEOUT_CHECKCNT  equ 250
 NEC98_ATA_BANKSEL       equ 432h
+NEC98_ATA_WAITSEL       equ 430h
 NEC98_PORT_WAIT600ns    equ 5fh
+
 
 ATA_TIMEOUT_DEVICE_READY  equ 2
 ATA_TIMEOUT_DEVICE_SELECT equ 2
@@ -101,6 +106,12 @@ ATA_TIMEOUT_IDENTIFY      equ 2
 ATA_TIMEOUT_NORMAL        equ 5
 ATA_TIMEOUT_DISC          equ 30
 
+;ATA_TIMEOUT_DEVICE_READY  equ 10
+;ATA_TIMEOUT_DEVICE_SELECT equ 10
+;ATA_TIMEOUT_COMMAND_SEND  equ 10
+;ATA_TIMEOUT_IDENTIFY      equ 10
+;ATA_TIMEOUT_NORMAL        equ 25
+;ATA_TIMEOUT_DISC          equ 60
 
 struc TVALnec98
     .checkcnt     resw 1
@@ -148,7 +159,7 @@ device_name:
 ; cd-rom drive
 
 cd_drvnum:
-    db 02h		; 0ffh
+    db 01h		; 0ffh
 cd_media_inserted:
     db 00h
 cd_media_changed:
@@ -184,13 +195,13 @@ tval:
     times 6 db 0      ; max(TVALnec98_size, TVALibm_size)
 
 ata_wait_bsyvalid:
-    dw Wait400ns_ibm
+    dw Wait600ns_nec98
 ata_select_ports:
-    dw ATASelectPorts_ibm
+    dw ATASelectPorts_nec98
 set_timeout_count:
-    dw SetTimeoutCount_ibm
+    dw SetTimeoutCount_nec98
 is_timeout:
-    dw isTimeout_ibm
+    dw isTimeout_nec98
 
 ata_drivenum:
     dw 0002h		; (0..3)
@@ -207,7 +218,7 @@ atareg:
     db 10100000b    ; Device/Head  obs=1
     db 0            ; Command
     db 00001010b    ; Device Control  nIEN=1 bit3=1
-
+    db 0	    ; Check DRDY
 
 ata_lasterror:
     db 0
@@ -217,9 +228,11 @@ atapi_asc:
     db 0
 atapi_ascq:
     db 0
+atapi_mode:
+    db 0
 
 is_nec98:
-    db 0
+    db 1
 isNECCD260:
     db 0
 
@@ -239,22 +252,22 @@ atapi_bytecount:
 
 
 wait_bsy0_atapi:
-    mov dx, word [bx + OFS_ALTERNATE_STATUS]
-    in al, dx
     mov dx, [bx + OFS_STATUS]
     jmp short wait_bsy0.lp
 
 wait_bsy0:
     mov dx, word [bx + OFS_ALTERNATE_STATUS]
   .lp:
+;    call Wait600ns_nec98
     in al, dx
     test al, 80h
-    jnz .wait
+    jnz .wait	; call先で戻り値を使ってStatusのERR bitを判定するのでここでErr判定していない
     ret
   .wait:
     sti
     call [is_timeout]
     jnc .lp
+  .err:
     mov ax, 0ffffh
     ret
 
@@ -274,18 +287,29 @@ wait_drq0:
     
 
 wait_drq1:
-    mov dx, word [bx + OFS_ALTERNATE_STATUS]
   .lp:
+;OriginalのコードではERRコードを返した時の判定が不十分だったので処理を追加
+    mov dx, word [bx + OFS_ALTERNATE_STATUS]
     in al, dx
     test al, 80h  ; check BSY = 0
     jnz .wait
+    test al, 01h  ; check ERR = 1
+    jnz .err
     test al, 08h  ; check DRQ = 1
+    jz .wait
+    mov dx, word [bx + OFS_INTERRUPT_REASON]
+    in al, dx
+    test al, 02h  ; check BIT_IO = 0
+    jnz .wait
+    test al, 01h  ; check BIT_CD = 1
     jz .wait
     ret
   .wait:
     sti
     call [is_timeout]
     jnc .lp
+  .err:
+    stc
     mov ax, 0ffffh
     ret
 
@@ -304,6 +328,18 @@ wait_drdy1:
     jnc .lp
     mov ax, 0ffffh
     ret
+
+
+wait_Onlydrdy1:
+;ATASendCommandのWrite CMDではBUSYは見てはいけない
+;(MMC6ではIDLE時に勝手にoverlappedで実行されるCMDが存在する）
+    mov dx, word [bx + OFS_ALTERNATE_STATUS]
+  .lp:
+    in al, dx
+    test al, 40h  ; check DRDY = 0
+    jnz .lp
+    ret           ; CF=0 normal exit
+
 
 
 
@@ -367,15 +403,53 @@ ATASelectDevice_withTimeout:
     call [set_timeout_count]
     pop ax
 ATASelectDevice:
+;DRQ registerを立っていた時の復旧処理を追加
   .lp1:
+    mov dx, [bx + OFS_ALTERNATE_STATUS] ; read Alternate Status Register
+    in al, dx
+    test al, 88h  ; check BSY=0
+    jz .next_step
+    test al, 08h  ; check DRQ=0
+    jz .next_step
+
+;dummy read/writeでDRQ要求を消す
+    mov dx, [bx + OFS_INTERRUPT_REASON]
+    in al, dx
+    test al, 00000010b        ; I/O
+    jz .todev
+    mov dx, word [bx + OFS_DEVICE]
+  .fromdev:
+    in al, dx
+    jmp short .lp1
+  .todev:
+    out dx, al
+    jmp short .lp1
+
+    .next_step:
     mov al, [atareg + IDX_DEVICE]
     mov dx, word [bx + OFS_DEVICE]
     out dx, al
     call [ata_wait_bsyvalid]  ; (need 400ns wait)
-    mov dx, word [bx + OFS_STATUS]
+
+   .asr_loop:
+
+    mov dx, [bx + OFS_ALTERNATE_STATUS] ; read Alternate Status Register
     in al, dx
-    test al, 88h  ; check BSY=0 and DRQ=0
-    jnz .lp_check_timeout
+    test al, 88h  ; check BSY=0
+    jz   .bsyout
+    jmp .asr_loop
+
+   .bsy_loop:
+   mov dx, word [bx + OFS_STATUS]
+   in al, dx
+   test al, 88h  ; check BSY=0 and DRQ=0
+   jz .bsyout
+   call [ata_wait_bsyvalid]  ; (wait for a proof...)
+   call [is_timeout]
+   jnc .bsy_loop
+   jmp .timeout
+
+  .bsyout:
     mov dx, [bx + OFS_DEVICE]		; check DEV bit
     in al, dx
     mov ah, [atareg + IDX_DEVICE]
@@ -387,10 +461,6 @@ ATASelectDevice:
   .noerr:
     xor ah, ah
     ret
-  .lp_check_timeout:
-    call [ata_wait_bsyvalid]  ; (wait for a proof...)
-    call [is_timeout]
-    jnc .lp1
   .timeout:
     mov ax, 0ffffh
   .error:
@@ -409,11 +479,12 @@ ATASelectDevice:
 ; AL        result status
 ;
 ATASendCommand:
+    call ATAPrepareSelectDevice
     call ATASelectDevice    ; select device and write Drive/Head reg
     mov dx, [bx + OFS_DEVICE_CONTROL]
     mov al, [atareg + IDX_DEVICE_CONTROL]
 ;    and al, 0fbh          ; SRST = 0 (no reset)
-;    or al, 02h            ; nIEN = 1 (disable int)
+    or al, 02h            ; nIEN = 1 (disable int)
     out dx, al
     mov dx, [bx + OFS_FEATURES]
     mov al, [atareg + IDX_FEATURES]
@@ -430,15 +501,23 @@ ATASendCommand:
     mov dx, [bx + OFS_CYLINDER_H]
     mov al, [atareg + IDX_CYLINDER_H]
     out dx, al
+    mov al, [atareg + IDX_DRDY_Chk]
+    test al,01h
+    jz .write_cmd
+    call wait_Onlydrdy1
     ; write command
+    .write_cmd:
     mov dx, [bx + OFS_COMMAND]
     mov al, [atareg + IDX_COMMAND]
     out dx, al
     call [ata_wait_bsyvalid]
     mov dx, [bx + OFS_ALTERNATE_STATUS] ; read Alternate Status Register
     in al, dx                           ; and drop it
-    call wait_bsy0
+    call wait_bsy0					;Call先でERRチェックはしていないので追加する必要があるかも（検討）
     jc ata_checkstatus.exit          ; timeout
+    test al, 01h  ; check CHK = 1
+    jnz ATASendCommand		;とりあえずErrorなので再送してみる
+
     ; fallthrough
 ata_checkstatus:
     mov dx, [bx + OFS_STATUS]
@@ -483,6 +562,7 @@ ATAPIReadStatus:
 ; df = 0 (cld)
 ;
 ATAReadData:
+    call ATASelectWaitData_nec98	;Wait値の変更(Data mode)
     mov dx, [bx]    ; bx + OFS_DATA
     push cx
     push di
@@ -492,6 +572,7 @@ ATAReadData:
     rep insw
     pop di
     pop cx
+    call ATASelectWaitReg_nec98		;Wait値を元に戻す(Reg mode)
     ret
 
 
@@ -505,6 +586,7 @@ ATAReadData:
 ; df = 0 (cld)
 ;
 ATAWriteData:
+    call ATASelectWaitData_nec98	;Wait値の変更(Data mode)
     mov dx, [bx]    ; bx + OFS_DATA
     push cx
     push si
@@ -517,6 +599,7 @@ ATAWriteData:
     pop ds
     pop si
     pop cx
+    call ATASelectWaitReg_nec98		;Wait値を元に戻す(Reg mode)
     ret
 
 ;
@@ -564,102 +647,7 @@ ATAPIPostProcess:
     ret
 %endif
 
-
-;--------------------------------------
-; Machine specific part
-; IBM   IBM PC/AT, PS/2 or comaptibles
-; NEC98 NEC PC-9801/9821 or compatibles
-
-
-
-;--------------------------------------
-; IBM ATA stuff
-
-ata_ports_ibm_primary:
-    dw 1f0h, 1f1h, 1f2h, 1f3h, 1f4h, 1f5h, 1f6h, 1f7h, 3f6h
-ata_ports_ibm_secondary:
-    dw 170h, 171h, 172h, 173h, 174h, 175h, 176h, 177h, 376h
-
-
-getlowertick_ibm:
-    push ds
-    xor ax, ax
-    mov ds, ax
-    mov ax, word [IBM_TIMER_TICKS]
-    pop ds
-    ret
-
-SetTimeoutCount_ibm:
-    push dx
-    push cx
-    cmp ax, 3604    ; (55 * 65536 / 1000)
-    jb .l2
-    mov ax, 0ffffh
-    jmp short .store
-  .l2:
-    mov cx, 1000
-    mul cx
-    mov cx, 55
-    div cx
-  .store:
-    mov [cs: tval + TVALibm.remain_55ms], ax
-    call getlowertick_ibm
-    mov [cs: tval + TVALibm.prev_tick], ax
-    pop cx
-    pop dx
-    ret
-
-isTimeout_ibm:
-    push ax
-    push bx
-    push cx
-    mov cx, [cs: tval + TVALibm.remain_55ms]
-    jcxz .exit_cx
-    call getlowertick_ibm
-    mov bx, [cs: tval + TVALibm.prev_tick]
-    cmp ax, bx
-    je .exit          ; return if tick not inc... (with CF=0)
-    mov [cs: tval + TVALibm.prev_tick], ax
-    ja .diff_normal
-    neg bx            ; roundup (e.g. prev FFFFh -> new 0001h)
-    add ax, bx
-    jmp short .cntdown
-  .diff_normal:
-    sub ax, bx
-  .cntdown:
-    sub cx, ax
-    jae .cntdown2
-    xor cx, cx
-  .cntdown2:
-    mov [cs: tval + TVALibm.remain_55ms], cx
-  .exit_cx:
-    cmp cx, 1         ; set CF if cx == 0
-  .exit:
-    pop cx
-    pop bx
-    pop ax
-    ret
-
-
-ATASelectPorts_ibm:
-    mov bx, ata_ports_ibm_primary
-    test al, 2
-    jz .l2
-    mov bx, ata_ports_ibm_secondary
-  .l2:
-    ret
-
-
-Wait400ns_ibm:
-    push ax
-    mov ah, 3       ; how many does it need...?
-  .lp:
-    in al, 61h      ; KB controller B (NMISC in intel chipset ref.)
-    dec ah
-    jne .lp
-    pop ax
-    ret
-
+;IBM系の記述を削除しています。
 
 ;--------------------------------------
 ; NEC PC-98 IDE stuff
@@ -667,8 +655,13 @@ Wait400ns_ibm:
     align 2
 
 ata_ports_nec98:
-    dw 640h, 642h, 644h, 646h, 648h, 64ah, 64ch, 64eh, 74ch
+    dw 0cc0h, 0cc2h, 0cc4h, 0cc6h, 0cc8h, 0ccah, 0ccch, 0cceh, 0dcch
 
+;OriginalのIDEポートを使う場合は以下のアドレスで実行
+;    dw 640h, 642h, 644h, 646h, 648h, 64ah, 64ch, 64eh, 74ch
+
+ata_ports_nec98_2:
+    dw 0ec0h, 0ec2h, 0ec4h, 0ec6h, 0ec8h, 0ecah, 0ecch, 0eceh, 0fcch
 
 getbcdsecond_nec98:
     push bx
@@ -716,17 +709,44 @@ isTimeout_nec98:
     pop ax
     ret
 
+ATASelectWaitReg_nec98:
+    push ax
+    push dx
+    mov dx, NEC98_ATA_WAITSEL
+    mov al,00
+    out dx, al
+    pop dx
+    pop ax
+    ret
+
+ATASelectWaitData_nec98:
+    push ax
+    push dx
+    mov dx, NEC98_ATA_WAITSEL
+    mov al,01
+    out dx, al
+    pop dx
+    pop ax
+    ret
+
 ATASelectPorts_nec98:
+;98FB向けにIDEのIOポート選択が追加になっています。
     push ax
     push dx
     mov dx, NEC98_ATA_BANKSEL
-    and al, 2
-    shr al, 1
+    mov al,01
     out dx, al
-    out NEC98_PORT_WAIT600ns, al  ; wait for a proof...
+;98FBの場合は当該register書き込みは有効化の為なのでWait不要
+;   out NEC98_PORT_WAIT600ns, al  ; wait for a proof...
+
     pop dx
     pop ax
     mov bx, ata_ports_nec98
+    test al,2
+    jnz .port_2
+    ret
+ .port_2:
+    mov bx, ata_ports_nec98_2
     ret
 
 Wait600ns_nec98:
@@ -753,10 +773,11 @@ ATAPIOin_withTimeout:
     call [set_timeout_count]
     pop ax
 ATAPIOin:
+    call ATAPrepareSelectDevice
     call ATASelectDevice
     jc atapioin_exit.justret
     call wait_drdy1
-    jnc ATAPIOin_nodrdy.after_select
+	jnc ATAPIOin_nodrdy.after_select
     jmp short atapioin_exit
 
 ; ATAPIOin_nodrdy
@@ -771,6 +792,7 @@ ATAPIOin_nodrdy_withTimeout:
     call [set_timeout_count]
     pop ax
 ATAPIOin_nodrdy:
+    call ATAPrepareSelectDevice
     call ATASelectDevice
     jc atapioin_exit.justret
     call ATASendCommand
@@ -793,7 +815,9 @@ atapioin_exit:
 ; ds            cs
 
 ATAPIOpacket:
-    call ATASelectDevice
+;ここに来るときは事前に選択済みなはずなのでポートセレクトは削除
+;   call ATAPrepareSelectDevice
+;   call ATASelectDevice
     jc .justret
     mov [atapi_max_bytecount], cx
     xor ax, ax
@@ -805,6 +829,7 @@ ATAPIOpacket:
     mov byte [atareg + IDX_COMMAND], 0a0h           ; PACKET command
     call ATASendCommand
     jc .error
+
     call wait_drq1
     jc .exit                  ; timeout
     push cx
@@ -819,16 +844,30 @@ ATAPIOpacket:
     pop si
     pop cx
   .lp:
-    call wait_bsy0_atapi
+    call wait_bsy0_atapi 
     jc .exit                  ; timeout
+
     test al, 1
-    jnz .error2
+    jnz .error2					;ERR check
     test al, 8h
-    jz .fin                   ; DRQ=0
+    jnz .dataTransChk           ; DRQ=0
+
+;Packet CMD END checkのチェックを厳密にした
+;PMがDeep SleepにいるときなどINTregisterにBIT立ててDRQを立てないケースがあるが
+;Originalはそのチェックが無く、次のCMDが実行できないドライブがいる
     mov dx, [bx + OFS_INTERRUPT_REASON]
     in al, dx
-    test al, 00000101b        ; REL=0,C/D=0...more data to transfer
-    jnz .fin
+    test al, 00000001b        ; C/D=1 or NOT
+    jz .lp
+    test al, 00000010b        ; I/O=1 or NOT
+    jz .lp
+    jmp .fin		      ; パケットコマンド実行終了
+  .dataTransChk:
+    mov dx, [bx + OFS_INTERRUPT_REASON]
+    in al, dx
+    test al, 00000001b        ; C/D=1 or NOT
+    jnz .lp
+
 %if 1
     xchg ax, cx
     mov dx, [bx + OFS_BYTECOUNT_H]
@@ -853,11 +892,18 @@ ATAPIOpacket:
     add cx, [atapi_bytecount]
     mov [atapi_bytecount], cx
     cmp cx, [atapi_max_bytecount]
-    jb .lp
+    jb .lp 
     
   .fin:
-    call ATAPIReadStatus
-    jnc .exit
+ ;MMC6系はDMAを使っていなくてもDRQと同時に割り込みを立て続けるドライブがいるので対策
+ ;NOP CMDは不要なのでATAPIReadStatusは捨てた
+    mov dx, [bx + OFS_STATUS]
+    in al, dx			;Statusレジスタ空読みで割り込み要因を殺しておく
+    test al, 80h  		;check BSY=0 and DRQ=0
+    jnz .fin			;Time Out処理が無いけど・・・消えるまで待つ
+    ret					;正常終了
+
+
   .error:
     cmp ah, 1
     jne .errorexit
@@ -1040,7 +1086,6 @@ AbsMSFtoLBA_dosdrv:
 
 
 ;---------------------------------------
-
 CDBuf_ATAPIcmd_TestUnitReady:
     call clear_atapi_packet
     ;mov byte [atapi_packet], 0
@@ -1131,7 +1176,8 @@ CDBuf_ATAPIcmd_ModeSense:
     xor ch, ch
     mov byte [atapi_packet + 7], ch
     mov byte [atapi_packet + 8], cl
-    ; fall-thruough
+	; fall-thruough
+
 cdbuf_atapicmd_common:
     push si
     push es
@@ -1142,6 +1188,7 @@ cdbuf_atapicmd_common:
     pop es
     pop si
     jc atapicmd_common_err
+
 atapicmd_common_noerr:
     mov ax, [atapi_bytecount]
     ret
@@ -1542,6 +1589,32 @@ ATAPIcmd_PlayCDLBA:
     xor cx, cx
     call ATAPIcmd_withTimeout
     ret
+;
+; Play CD (Use PLAY CD)
+; in
+; ds:si             lba packet (need ds = cs)
+;    +0 start LBA
+;    +4 Size
+;
+ATAPIcmd_PlayCD2LBA:
+    call clear_atapi_packet
+    mov byte [atapi_packet], 045h
+
+    mov ax, [si]
+    mov dx, [si + 2]
+    mov [atapi_packet + 2], ax
+    mov [atapi_packet + 4], dx
+    mov ax, [si + 4]
+    mov dx, [si + 6]
+    mov [atapi_packet + 6], ax
+    mov [atapi_packet + 8], dx
+    
+    
+    xor cx, cx
+    call ATAPIcmd_withTimeout
+    ret
+
+
 
 ;
 ; Pause/Resume CD
@@ -1553,6 +1626,23 @@ ATAPIcmd_PauseCD:
     mov [atapi_packet + 8], al
     xor cx, cx
     call ATAPIcmd_withTimeout
+    ret
+;
+; Device Reset
+; in 		none
+; out
+; CY        1 = err
+; AX        -1 = timeout
+; AH        1 = err
+; AL        result status
+
+ATAcmd_DeviceReset:
+    call ATAPrepareSelectDevice			    ;busyでも発行する
+    mov byte [atareg + IDX_FEATURES], 0
+    mov byte [atareg + IDX_SECTOR_COUNT], 0         ; TAG
+    mov word [atareg + IDX_BYTECOUNT_L], cx
+    mov byte [atareg + IDX_COMMAND], 008h           ; device reset command
+    call ATASendCommand
     ret
 
 ;---------------------------------------
@@ -1572,6 +1662,9 @@ private_stack_count:
 
 request_header:
     dd 0
+    dd 0
+
+    align 16
 
 Strategy:
     mov word [cs: request_header], bx
@@ -1639,7 +1732,6 @@ Commands:
 
 
 Command_ReadLongPrefetch:
-Command_Seek:
 Command_Unknown:
     mov ax, 8103h
     ret
@@ -1671,11 +1763,16 @@ ioctl_inout:
     ja Command_Unknown
     shl ax, 2
     add si, ax
-    cmp cx, word [si + 2]
-    ;jne Command_Unknown
-    jb Command_Unknown
+;ポリスノーツ対策
+;ポリスノーツは(DeviceStatusの）Number of bytes to transferサイズが不適切な設定になっている。
+;そのためパラメータチェックを入れると起動できない。
+;   cmp cx, word [si + 2]
+;   ;jne Command_Unknown
+;   jb Command_Unknown
     call word [si + 4]
     ret
+
+    align 16
 
 ioctl_table_in:
     dw 15
@@ -1729,7 +1826,8 @@ cmd_table_80:
     dw Command_Unknown		; out of region
     dw Command_ReadLong		; 128 Read Long
     dw Command_Unknown          ; 129 (reserved)
-    dw Command_ReadLongPrefetch ; 130 Read Long Prefetch
+;    dw Command_ReadLongPrefetch ; 130 Read Long Prefetch
+    dw Command_ReadLong		; 130 Read Long Prefetch
     dw Command_Seek             ; 131 Seek
     dw Command_Play             ; 132 Play Audio
     dw Command_Stop             ; 133 Stop Audio
@@ -1737,7 +1835,6 @@ cmd_table_80:
     dw Command_Unknown          ; 135 Write Long Verify
     dw Command_Resume           ; 136 Resume Audio
 
-;---------------------------------------
 
 cdDriveNum:
     mov ax, [cd_drvnum]
@@ -2215,9 +2312,16 @@ cdplay_start_lba:
 cdplay_end_lba:
     dd 0
 
+cdplay_playcd:
+    db 0
+
 
 
 Command_Play:
+    mov al,byte[cdplay_playcd]
+    cmp al, 01h
+    jz .UsePlayCD
+    ;Try PLAY AUDIO MSF
     call cdCheckDiscIn
     jc .err_notready
     les di, [request_header]
@@ -2233,8 +2337,15 @@ Command_Play:
     mov si, cdplay_packet
     mov [si], ax
     mov [si + 2], dx
-    add ax, [es: di + 18]
-    adc dx, [es: di + 20]
+    
+    mov ax, [es: di + 18]
+    mov dx, [es: di + 20]
+    test cl, 1
+    jz .l22
+    call MSFtoLBA_dosdrv
+  .l22:
+    add ax, [si]
+    adc dx, [si+2]
     mov [si + 4], ax
     mov [si + 6], dx
     push cs
@@ -2242,6 +2353,37 @@ Command_Play:
     call ATAPIcmd_PlayCDLBA
     mov ax, 0300h
     jnc .just_ret
+
+   .UsePlayCD:
+    ;Try PLAY Audio (LBA)
+    call cdCheckDiscIn
+    jc .err_notready
+    les di, [request_header]
+    mov cl, [es: di + 13]
+    test cl, 0feh
+    jnz .err_param
+    mov ax, [es: di + 14]
+    mov dx, [es: di + 16]
+    test cl, 1
+    jz .l3
+    call AbsMSFtoLBA_dosdrv
+  .l3:
+    mov si, cdplay_packet
+    mov [si], ax
+    mov [si + 2], dx
+
+    mov ax, [es: di + 18]
+    mov dx, [es: di + 20]
+    mov [si + 4], ax
+    mov [si + 6], dx
+    push cs
+    pop es
+    call ATAPIcmd_PlayCD2LBA
+    mov ax, 0300h
+    jc .err_notready
+    mov byte [cdplay_playcd],1
+    ret
+
   .err_notready:
     mov ax, 8102h
   .err_param:
@@ -2378,11 +2520,42 @@ CD_MediaChanged:
     mov [es: di + 1], dl
     ret
 
+Command_Seek:
+;PCFX系のソフトでSeekを使っており、unsupportだと正常に動かないから対応
+;他のドライバだとPlayAudio (pause)使っているのもある。
+    call cdCheckDiscIn
+    jc .just_ret
+    push ds
+    lds si, [request_header]
+    mov cx, [si + 18]
+    and cx, 7fffh			; (just for a proof)
+  .l1:
+    mov al, byte [si + 13]		; addressing mode
+    test al, 0feh			; valid only 0 (LBA) or 1 (RedBook)
+    jnz .err_paramchk
+    test al, 1
+    mov ax, [si + 20]			; starting sector
+    mov dx, [si + 22]
+    jz .l2
+    call AbsMSFtoLBA_dosdrv
+  .l2:
+    mov [cdplay_start_lba], ax
+    mov [cdplay_start_lba + 2], dx
+    mov [cdplay_end_lba], ax
+    mov [cdplay_end_lba + 2], dx
+    pop ds
+    mov ax, 0100h
+  .just_ret:
+    ret
 
+  .err_paramchk:
+    pop ds
+    mov ax, 810ch
+    ret
 
 CD_ResetDrive:
-    ;todo
-    ; mov byte [cd_need_update], 1
+    mov byte [cd_need_update], 1
+    call ATAcmd_DeviceReset
     jmp cd_done
 
 CD_EjectDisk:
@@ -2503,6 +2676,7 @@ Command_ReadLong:
     ret
   .err_read:
     mov ax, 810bh
+
     ret
 
   .err_paramchk:
@@ -2510,166 +2684,7 @@ Command_ReadLong:
     mov ax, 810ch
     ret
 
-
-
-    align 16
-TSR_bottom:
-;
-
-
-;---------------------------------------
-; ATAIdentifyDevice
-; in
-; (al    drive (0..3))
-; [ata_drivenum] drive (0..3))
-; ds    = cs
-; es:si buffer (up to 512bytes)
-; cx    bytes of buffer (2..512, must be even)
-;
-; out
-; ax    result
-;       -1 timeout
-;       bit8=1  error
-;            0  al = 00..1Fh atapi device type
-;                    FF      not atapi (ata)
-; cy    set if error
-; buffer512
-;       device information (if not error)
-; bx,dx will be modified
-;
-
-ATAIdentifyDevice:
-    push ax
-    mov ax, ATA_TIMEOUT_IDENTIFY
-    call [set_timeout_count]
-    pop ax
-    
-    call ATAPrepareSelectDevice
-    call ATASelectDevice
-    jc .justret                               ; timeout or error
-    
-    mov byte [atareg + IDX_COMMAND], 0a1h    ; IDENTIFY PACKET DEVICE
-    call ATASendCommand
-    jnc .readdata
-    call ATAReadStatus
-    call wait_drdy1
-    jc .exit                                  ; timeout
-    mov byte [atareg + IDX_COMMAND], 0ech    ; IDENTIFY DEVICE
-    call ATASendCommand
-    jc .exit
-    test al, 20h                              ; check DF=0 for a proof
-    jnz .nodevice
-  .readdata:
-    ;call ATAReadData
-    mov dx, [bx]    ; bx + OFS_DATA
-    push cx
-    push si
-    push di
-    mov di, si
-    cmp cx, 512
-    jbe .rd_01
-    mov cx, 512
-  .rd_01:
-    inc cx
-    shr cx, 1
-    mov si, 256
-    sub si, cx
-    ;pushf
-    rep insw
-    ;popf
-    ;jbe .readdata_end
-    mov cx, si
-    jcxz .readdata_end
-  .readdrop_lp:
-    in ax, dx
-    loop .readdrop_lp
-  .readdata_end:
-    pop di
-    pop si
-    pop cx
-
-    call ATAReadStatus
-    jc .exit
-    ; quick check data correctness
-    ; (model infomation chars are in ascii?)
-    cmp cx, 27 * 2 + 2
-    jb .isata_atapi
-    mov ax, word [es: si + (27 * 2)]		; Model Number (word 27~46)
-    cmp ah, 20h
-    jb .nodevice
-    cmp ah, 7fh
-    jae .nodevice
-    cmp al, 20h
-    jb .nodevice
-    cmp al, 7fh
-    jae .nodevice
-  .isata_atapi:
-    ; quick check bit15,14 in word0
-    ; bit15 14 
-    ;     1  0 atapi
-    ;     0  x ata
-    mov ax, word [es: si]
-    or ax, ax
-    je .nodevice
-    ;cmp ax, 0ffffh
-    ;je .nodevice
-    test ah, 80h
-    jz .ata_or_atapi      ; bit15=0: maybe ata
-    test ah, 40h
-    jz .ata_or_atapi      ; bit15=1,bit14=0: maybe atapi
-  .nodevice:
-    mov ax, 01ffh
-    stc
-    jmp short .exit
-  .ata_or_atapi:
-    shr ax, 5
-    shr al, 3
-    and ah, 110b
-    cmp ah, 100b
-    je .noerr
-    mov al, 0ffh
-  .noerr:
-    xor ah, ah
-  .exit:
-    call ATAPostProcess
-  .justret:
-    ret
-
-
-
-isNEC98:        ; detect IBMPC/NEC98 by checking int 1Ah AH=0 has (no) op
-    push ax
-    push cx
-    push dx
-    mov cx, 0ffffh
-    mov ah, 0
-    int 1ah
-    cmp cx, 0ffffh
-    jne .ibm
-    mov cx, 0fffeh
-    mov ah, 0
-    int 1ah
-    cmp cx, 0fffeh
-    stc
-    mov byte [is_nec98], 1
-    jz .exit
-  .ibm:
-    or al, al   ; just for ensure CF=0
-  .exit:
-    pop dx
-    pop cx
-    pop ax
-    ret
-
-
-SwitchToNEC98:
-    mov word [cs: ata_wait_bsyvalid], Wait600ns_nec98
-    mov word [cs: ata_select_ports], ATASelectPorts_nec98
-    mov word [cs: set_timeout_count], SetTimeoutCount_nec98
-    mov word [cs: is_timeout], isTimeout_nec98
-    ret
-
-
+; デバッグ用に常駐領域に移動
 ;-------------------------------
 ; display message
 
@@ -2677,8 +2692,6 @@ SwitchToNEC98:
 
 do_verbose:
     db 1
-
-
 
 putc_verbose:
     cmp byte [do_verbose], 0
@@ -2747,15 +2760,174 @@ putmsg_ln:
     call putmsg
     jmp short putn
 
-putmsg_cx:
-    push cx
+
+
+    align 16
+TSR_bottom:
+
+;---------------------------------------
+; ATAIdentifyDevice
+; in
+; (al    drive (0..3))
+; [ata_drivenum] drive (0..3))
+; ds    = cs
+; es:si buffer (up to 512bytes)
+; cx    bytes of buffer (2..512, must be even)
+;
+; out
+; ax    result
+;       -1 timeout
+;       bit8=1  error
+;            0  al = 00..1Fh atapi device type
+;                    FF      not atapi (ata)
+; cy    set if error
+; buffer512
+;       device information (if not error)
+; bx,dx will be modified
+;
+
+ATAIdentifyDevice:
+
+    push ax
+    mov ax, ATA_TIMEOUT_IDENTIFY
+    call [set_timeout_count]
+    pop ax
+    call ATAPrepareSelectDevice
+    call ATASelectDevice
+    jc .justret                               ; timeout or error
+    mov byte [atareg + IDX_COMMAND], 0a1h    ; IDENTIFY PACKET DEVICE
+    call ATASendCommand
+    jnc .readdata
+    call ATAReadStatus
+    call wait_drdy1
+    jc .exit                                  ; timeout
+    mov byte [atareg + IDX_COMMAND], 0ech    ; IDENTIFY DEVICE
+    call ATASendCommand
+    jc .exit
+    test al, 20h                              ; check DF=0 for a proof
+    jnz .nodevice
+
+  .readdata:
+    ;call ATAReadData
+    call ATASelectWaitData_nec98
+    mov dx, [bx]    ; bx + OFS_DATA
+    push cx	
     push si
-  .lp:
-    lodsb
-    call putc
-    loop .lp
+    push di
+    mov di, si
+    cmp cx, 512
+    jbe .rd_01
+    mov cx, 512
+  .rd_01:
+    inc cx
+    shr cx, 1
+    mov si, 256
+    sub si, cx
+    ;pushf
+    rep insw
+    call ATASelectWaitReg_nec98
+    ;popf
+    ;jbe .readdata_end
+    mov cx, si
+    jcxz .readdata_end
+  .readdrop_lp:
+    in ax, dx
+    loop .readdrop_lp
+  .readdata_end:
+    pop di
     pop si
     pop cx
+
+    call ATAReadStatus
+    jc .exit
+    ; quick check data correctness
+    ; (model infomation chars are in ascii?)
+    cmp cx, 27 * 2 + 2
+    jb .isata_atapi
+    mov ax, word [es: si + (27 * 2)]		; Model Number (word 27~46)
+    cmp ah, 20h
+    jb .nodevice
+    cmp ah, 7fh
+    jae .nodevice
+    cmp al, 20h
+    jb .nodevice
+    cmp al, 7fh
+    jae .nodevice
+
+  .isata_atapi:
+    ; quick check bit15,14 in word0
+    ; bit15 14 
+    ;     1  0 atapi
+    ;     0  x ata
+    mov ax, word [es: si]
+    or ax, ax
+    je .nodevice
+    ;cmp ax, 0ffffh
+    ;je .nodevice
+    test ah, 80h
+    jz .ata_or_atapi      ; bit15=0: maybe ata
+    test ah, 40h
+    jz .ata_or_atapi      ; bit15=1,bit14=0: maybe atapi
+
+
+  .nodevice:
+    mov ax, 01ffh
+    stc
+    jmp short .exit
+
+  .ata_or_atapi:
+;CMD Packet sizeのチェックRoutineを追加
+    test al, 3h
+    jz .packetsize_done      ; bit10=00: Command packet =12Byte
+    push ax
+    mov ax, 16
+    mov [atapi_packet_size],ax
+    pop ax
+
+  .packetsize_done:
+    shr ax, 5
+    shr al, 3
+    and ah, 110b
+    cmp ah, 100b
+    je .noerr
+    mov al, 0ffh
+  .noerr:
+    xor ah, ah
+  .exit:
+    call ATAPostProcess
+  .justret:
+    ret
+
+isNEC98:        ; detect IBMPC/NEC98 by checking int 1Ah AH=0 has (no) op
+    push ax
+    push cx
+    push dx
+    mov cx, 0ffffh
+    mov ah, 0
+    int 1ah
+    cmp cx, 0ffffh
+    jne .ibm
+    mov cx, 0fffeh
+    mov ah, 0
+    int 1ah
+    cmp cx, 0fffeh
+    stc
+    mov byte [is_nec98], 1
+    jz .exit
+  .ibm:
+    or al, al   ; just for ensure CF=0
+  .exit:
+    pop dx
+    pop cx
+    pop ax
+    ret
+
+
+SwitchToNEC98:
+    mov word [cs: ata_wait_bsyvalid], Wait600ns_nec98
+    mov word [cs: ata_select_ports], ATASelectPorts_nec98
+    mov word [cs: set_timeout_count], SetTimeoutCount_nec98
+    mov word [cs: is_timeout], isTimeout_nec98
     ret
 
 
@@ -2787,6 +2959,7 @@ DetectATAPICD:
     mov cx, 256
     call ATAIdentifyDevice
     jnc .check
+
   .nodev:
     mov dx, msgNone
     call putmsg_verbose
@@ -2794,6 +2967,7 @@ DetectATAPICD:
     call putn_verbose
     mov ax, [ata_drivenum]
     inc ax
+    inc ax					;Slaveをチェックしない
     cmp ax, 4
     jb .lp00
     mov ax, 0ffffh
@@ -2821,6 +2995,7 @@ DetectATAPICD:
     call putmsg_verbose
     jmp short .next
   .atapi_inquiry:
+
     ; to check NECCD, use inquiry command
     call CDBuf_ATAPIcmd_Inquiry
     jc .nodev
@@ -2850,7 +3025,8 @@ DetectATAPICD:
     popf		; retrieve "CD-ROM?" flag
     jne .next		; (continue if not CD-ROM)
     add si, 8
-    mov di, strNECCD260
+;    mov di, strNECCD260
+    mov di, strNECCD291
     mov cx, 8 + 16
     repe cmpsb
     jne .atapi_l2
@@ -2864,9 +3040,9 @@ DetectATAPICD:
     jmp .exit
 
 msgPrimary:
-    db '  Port#0 ', eos
+    db '  Port:0xCC0 ', eos
 msgSecondary:
-    db '  Port#1 ', eos
+    db '  Port:0xEC0 ', eos
 msgMaster:
     db 'Master : ', eos
 msgSlave:
@@ -2881,9 +3057,12 @@ msgATAPICD:
     db ' (ATAPI CD-ROM)', eos
 strNECCD260:
     db 'NEC     ', 'CD-ROM DRIVE:260'	; 8 (vendor) + 16 (product) = 24chars
+strNECCD291:
+    db 'NEC     ', 'CD-ROM DRIVE:291'	; 8 (vendor) + 16 (product) = 24chars
 
 
 Init_Commands:
+;PC-ATのチェックを削除しています。
     push ax
     push bx
     push cx
@@ -2898,13 +3077,15 @@ Init_Commands:
     mov es, ax
     cld
     mov word [device_commands_entry], Commands
+
+    mov dx, msgOpening0
+    call putmsg_ln
     mov dx, msgOpening1
     call putmsg
-    mov si, devnamePCAT
-    call isNEC98
-    jnc .l2
+
     mov si, devnamePC98
     call SwitchToNEC98
+
   .l2:
     mov cx, 8
     mov di, devname
@@ -2913,6 +3094,10 @@ Init_Commands:
     call putmsg
     mov dx, msgOpening2
     call putmsg_ln
+    
+    mov dx, msgOpening3
+    call putmsg_ln
+
     
     les bx, [request_header]
     les si, [es: bx + 18]
@@ -2923,10 +3108,13 @@ Init_Commands:
     jmp short .not_resident
 
   .l3:
+
     push cs
     pop es
     call DetectATAPICD
     jc .err_nocd
+    call ATAcmd_DeviceReset
+
     
   .resident:
     mov dx, msgDeviceName
@@ -2948,6 +3136,7 @@ Init_Commands:
     jmp short .exit
     
   .err_nocd:
+
     mov dx, errNoCDROM
   .err_msgdisp:
     call putmsg_ln
@@ -3114,24 +3303,33 @@ devname:
     db '        '
     db eos
 
+msgOpening0:
+    db ' ',eos
+
 msgOpening1:
     db 'PATACD: Generic ATAPI CD-ROM driver ', eos
 devnamePC98:
     db 'CD_101  '
 msgPC98:
-    db '(PC98) ', eos
+    db '(for PC98FS IDE) ', eos
 devnamePCAT:
     db 'MSCD001 '
 msgPCAT:
     db '(PCAT) ', eos
 msgOpening2:
+;長すぎて1行に収まらないのでDATEだけに改変
     db ' built at '
-    db __UTC_DATE__, " ", __UTC_TIME__
-    db ' UTC'
+    db __UTC_DATE__
     db eos
+
+msgOpening3:
+;さすがに何も表記しないのは・・・
+    db'Copyright (C) 2016 sava (t.ebisawa) / Customized by @V9938 '
+    db eos 
 msgDeviceName:
     db 'CD-ROM device name : '
     db eos
+
 
 errNoCDROM:
     db 'error: No CD-ROM detected.', eos
