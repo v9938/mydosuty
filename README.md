@@ -1,4 +1,4 @@
-# PATACD for PC98FS-IDE
+# PATACD for PC98FileSlot-IDE
 @lpproj　さんが作成されたPATACD.SYSをPC98FileSlot-IDE用に改造したものです。
 
 
