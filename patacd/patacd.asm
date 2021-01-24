@@ -2930,12 +2930,23 @@ SwitchToNEC98:
     mov word [cs: is_timeout], isTimeout_nec98
     ret
 
-
+;PC98FS IDEの接続チェック
+PC98FS_PortCheck:
+    call ATAPrepareSelectDevice
+    mov dx, [bx + OFS_ALTERNATE_STATUS] ; read Alternate Status Register
+    in al, dx
+    cmp al, 0ffh  ; No Board
+    jz .error
+    cmp al, 07fh  ; IDEポートにデバイス無し
+    jz .error
+    xor ah, ah
+    ret
+  .error:
+    stc
+    ret
 
 
 ;--------------------------------------------------------------
-
-
 
 DetectATAPICD:
     push bx
@@ -2955,6 +2966,9 @@ DetectATAPICD:
     mov dx, msgSlave
   .lp01m3:
     call putmsg_verbose
+;PC98FS IDEの接続チェックを追加しました。
+    call PC98FS_PortCheck
+    jc   .nodev
     mov si, ata_identify_buf
     mov cx, 256
     call ATAIdentifyDevice
