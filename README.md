@@ -54,9 +54,9 @@ PANASOIC   LF-D521
 MITSUMI    CRMC-FX240S  
 NEC        AD-7173A  
 PANASONIC  SW-9585-C  
-MEDIATEK   IDE CD-ROM 3.2C
-BOSS-V     BOV-40B
-MEMOREX    CD-482E       ※Audio出力が他社より小さい
+MEDIATEK   IDE CD-ROM 3.2C  
+BOSS-V     BOV-40B  
+MEMOREX    CD-482E       ※Audio出力が他社より小さい  
 
 ##### PATAドライブ (Slim)
 HLDS       GCC-4243  
