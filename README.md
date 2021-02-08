@@ -39,10 +39,10 @@ MMC準拠Audio入力端子  x1
 2. 市販ゲームの動作確認   (KONAMI ポリスノーツ)
 3. PC-FXGAを使ったゲームの起動と簡単な動作チェック   (HUDSON チームイノセント）
 
-## ■ 動作確認済みなドライブ
+## ■ 動作確認済みドライブ
 
-#### ●動作に問題が無かったドライブ
-##### PATAドライブ
+#### ●動作に問題が無かったドライブ  
+##### PATAドライブ  
 PIONNER    DVR-112D  
 PLEXTOR    PX-760A  
 PLEXTOR    PX-755A  
@@ -51,19 +51,22 @@ Lite-On    SHM-165H6S
 HITACHI    GMA-4020B  
 RICOH      MP7200A  
 PANASOIC   LF-D521  
+PANASONIC  SW-9585-C  
 MITSUMI    CRMC-FX240S  
 NEC        AD-7173A  
-PANASONIC  SW-9585-C  
 MEDIATEK   IDE CD-ROM 3.2C  
 BOSS-V     BOV-40B  
-MEMOREX    CD-482E       ※Audio出力が他社より小さい  
 
 ##### PATAドライブ (Slim)
 HLDS       GCC-4243  
+HLDS       CRN-8245B  
 PIONNER    DVR-K16VAD  
 NEC        CDR-2800A  
-TEAC       CD-224E  
-PHILIPS    SCB5265
+NEC        CD-2800D  
+NEC        CD-2800E  
+TEAC       CD-224E       ※CSELの極性が他社と逆です。  
+TSST       TS-L462   
+PHILIPS    SCB5265  
 
 #### ●動作に問題は無いが、Audio出力が無いので音が出ないドライブ
 ##### PATAドライブ (Slim)
@@ -72,11 +75,20 @@ PHILIPS    SCB5265
 Lite-On    DH-16D5S  
 HLDS       GCC-H10N  
   
-#### ●DATAの読み込みはOKだが、AudioCMD(Play Audio/Stop Audio)に非対応/エラーが出るドライブ
+#### ●DATAの読み込みはOKだが、AudioCMD(Play Audio/Stop Audio)に非対応/エラーが出るドライブ  
 ##### PATAドライブ
 NEC        AD-5200A  
 ##### PATAドライブ (Slim)
 PANASONIC  UJ-845-B  (Slot-in Type)
 ##### SATAドライブ
 LG      WH10LS30  
-
+  
+#### ●動作に問題があるドライブ  
+##### PATAドライブ  
+MEMOREX    CD-482E       ※Audio出力が他社より小さい+Play Audioが2秒ずれます
+##### PATAドライブ (Slim)  
+TSST        TS-L162 ※Play Audioで音が出る前にReadyを返します。そのため再生位置とずれが生じる場合があります。   
+TSST        SN-124 ※Read10のデータが化ける場合があります。   
+MATSUSHITA  UJA720 (IBM P/N 27L7359) ※IBM仕様？Read10がErrorになります。
+HITACHI     CD-S200 (IBM P/N 27L4167) ※IBM仕様？Read10がErrorになります。
+ 
